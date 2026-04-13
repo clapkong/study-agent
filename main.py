@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import json
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -10,23 +11,52 @@ from deepagents import create_deep_agent
 from langchain_core.messages import HumanMessage
 from langchain_core.tools import tool
 
-from rich import box # TUI
-from rich.console import Console
-from rich.panel import Panel
-from rich.prompt import Confirm, Prompt
-from rich.table import Table
-
+# .env 파일에서 API 키 등 환경변수 로드
 load_dotenv()
 
-console = Console() # Rich 콘솔 (컬러 출력용)
 
-MODEL = "claude"  # "claude" | "openai"
+def _parse_args():
+    parser = argparse.ArgumentParser(description="Study Agent — AI 기반 학습 퀴즈 생성기")
+    parser.add_argument("material_file", help="학습 자료 파일 경로")
+    parser.add_argument(
+        "--provider", choices=["claude", "openai"], default="claude",
+        help="AI 제공자 (기본값: claude)",
+    )
+    parser.add_argument(
+        "--output-dir", default="./outputs", metavar="PATH",
+        help="결과 저장 디렉터리 (기본값: ./outputs)",
+    )
+    parser.add_argument(
+        "--num-questions", type=int, default=5, metavar="N",
+        help="생성할 문항 수 (기본값: 5)",
+    )
+    parser.add_argument(
+        "--difficulty", choices=["auto", "easy", "medium", "hard"], default="auto",
+        help="난이도 — auto면 자료에서 자동 판단 (기본값: auto)",
+    )
+    parser.add_argument(
+        "--question-types", default="multiple_choice,true_false,short_answer", metavar="TYPES",
+        help="문항 유형, 콤마 구분 (기본값: multiple_choice,true_false,short_answer)",
+    )
+    parser.add_argument(
+        "--max-retries", type=int, default=1, metavar="N",
+        help="퀴즈 검증 실패 시 최대 재생성 횟수 (기본값: 1)",
+    )
+    return parser.parse_args()
 
-# ── 토큰 사용량 누적 ──────────────────────────────────────────────────────────
+
+# 모듈 로드 시 바로 파싱 → 서브에이전트 생성 전에 MODEL/OUTPUT_DIR 확정
+_args = _parse_args()
+
+# 사용할 AI 제공자 및 출력 경로
+MODEL = _args.provider
+_OUTPUT_DIR = _args.output_dir
+
+# 세션 전체 누적 토큰 사용량 추적
 _total_input_tokens: int = 0
 _total_output_tokens: int = 0
 
-# AI 별 모델 매핑 — simple(가볍고 빠른)과 advanced(고품질)
+# AI 제공자별 모델 매핑 (simple | advanced)
 MODELS_MAP = {
     "claude": {
         "simple": "claude-haiku-4-5-20251001",
@@ -39,77 +69,51 @@ MODELS_MAP = {
 }
 
 def get_model(model_type: str) -> str:
-    """MODEL 전역변수에 따라 실제 모델 ID를 반환"""
+    """MODEL 전역변수에 따라 실제 모델 ID를 반환."""
     model_map = MODELS_MAP.get(MODEL, MODELS_MAP["claude"])
     return model_map.get(model_type, model_map["advanced"])
 
-
 def _parse_json(text: str) -> dict:
-    """LLM 응답에서 JSON을 추출. 코드펜스(```json```) 감싸져 있어도 처리.
-    세 가지 전략을 순차 시도: ①```json 블록 ②``` 블록 ③가장 바깥쪽 {} 매칭"""
-    import re
-
-    # 1: ```json ... ``` 블록에서 추출
-    match = re.search(r'```json\s*([\s\S]*?)\s*```', text)
+    match = re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', text)
     if match:
         try:
             return json.loads(match.group(1))
         except json.JSONDecodeError:
             pass
-
-    # 2: 레이블 없는 ``` ... ``` 블록
-    match = re.search(r'```\s*([\s\S]*?)\s*```', text)
-    if match:
-        try:
-            return json.loads(match.group(1))
-        except json.JSONDecodeError:
-            pass
-
-    # 3: 중괄호 깊이 추적으로 가장 바깥쪽 JSON 객체 추출
-    start = text.find('{')
-    if start != -1:
-        depth = 0
-        for i, ch in enumerate(text[start:], start):
-            if ch == '{':
-                depth += 1
-            elif ch == '}':
-                depth -= 1
-                if depth == 0:
-                    try:
-                        return json.loads(text[start:i + 1])
-                    except json.JSONDecodeError:
-                        break
-
-    return json.loads(text)  # 원본 그대로 시도 (JSONDecodeError 전파)
+    obj, _ = json.JSONDecoder().raw_decode(text, text.find('{')) # 에러 시 에러 전파
+    return obj
 
 
-# ── 중간 결과 저장 ───────────────────────────────────────────
-# 각 단계의 중간 결과(분석, 퀴즈, 답안 등)를 파일로 저장해서 중간에 에러가 나도 재개(resume)할 수 있게 하는 구조 (API 호출 비용 아끼기)
+# ── 중간 결과(아티팩트) 영속 저장 ─────────────────────────────────────────────
+# 각 단계(분석, 퀴즈 생성, 검증 등)의 결과를 세션 디렉터리에 JSON으로 보관하여
+# 세션 중단 후 재개 시 이전 결과를 재활용할 수 있게 한다.
 
-_SESSION_DIR: Optional[Path] = None
+_SESSION_DIR: Optional[Path] = None  # 현재 세션의 디렉터리 경로
 
 def _save_artifact(name: str, content: str) -> None:
-    """중간 결과를 세션 디렉터리에 JSON 파일로 저장"""
+    """중간 결과를 세션 디렉터리에 {name}.json 파일로 저장"""
     if _SESSION_DIR is None:
         return
     path = _SESSION_DIR / f"{name}.json"
     path.write_text(content, encoding="utf-8")
-    console.print(f"  [dim]저장됨 → {path}[/dim]")
-    console.print()
+    print(f"  저장됨 → {path}")
+    print()
 
 
 def _load_artifact(session_dir: Path, name: str) -> Optional[str]:
-    """세션 디렉터리에서 이전에 저장된 아티팩트를 읽어옴"""
+    """세션 디렉터리에서 이전에 저장된 아티팩트를 읽어옴. 없으면 None 반환."""
     path = session_dir / f"{name}.json"
     return path.read_text(encoding="utf-8") if path.exists() else None
 
 
 def _find_resumable_session(material_path: str) -> Optional[Path]:
-    """같은 자료에 대해 미완료 세션이 있는지 ./outputs에서 탐색.
-    가장 최근 세션부터 확인하며, completed=False인 세션을 반환."""
-    outputs = Path("./outputs")
+    """./outputs 하위에서 같은 학습 자료(material_path)에 대해
+    아직 완료되지 않은(completed=False) 가장 최근 세션 디렉터리를 탐색.
+    API 재호출 비용을 줄이기 위해 이전 중간 결과를 재활용하는 데 사용."""
+    outputs = Path(_OUTPUT_DIR)
     if not outputs.exists():
         return None
+    # 디렉터리 이름이 타임스탬프이므로 역순 정렬 = 최신 우선
     sessions = sorted(
         (s for s in outputs.iterdir() if s.is_dir()),
         reverse=True,
@@ -128,33 +132,35 @@ def _find_resumable_session(material_path: str) -> Optional[Path]:
 
 
 def _init_session(material_path: str) -> None:
-    """새 세션 디렉터리 생성 + 메타데이터(session.json) 기록"""
+    """새 세션 디렉터리(./outputs/YYYYMMDD_HHMMSS)를 생성하고
+    메타데이터(session.json)를 기록한다."""
     global _SESSION_DIR
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    _SESSION_DIR = Path("./outputs") / ts
+    _SESSION_DIR = Path(_OUTPUT_DIR) / ts
     _SESSION_DIR.mkdir(parents=True, exist_ok=True)
     meta = {
-        "material": material_path,
-        "completed": False,
+        "material": material_path,    # 원본 학습 자료 경로
+        "completed": False,           # 세션 완료 여부
         "started_at": ts,
     }
     (_SESSION_DIR / "session.json").write_text(
         json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
     )
-    console.print(f"  [dim]세션 시작 → {_SESSION_DIR}[/dim]")
-    console.print()
+    print(f"  세션 시작 → {_SESSION_DIR}")
+    print()
 
 
 def _resume_session(session_dir: Path) -> None:
-    """기존 세션 디렉터리를 현재 세션으로 설정 (재개)"""
+    """기존 미완료 세션 디렉터리를 현재 세션으로 설정 (재개)"""
     global _SESSION_DIR
     _SESSION_DIR = session_dir
-    console.print(f"  [dim]세션 재개 → {_SESSION_DIR}[/dim]")
-    console.print()
+    print(f"  세션 재개 → {_SESSION_DIR}")
+    print()
 
 
 def _mark_session_complete() -> None:
-    """세션 메타데이터에 completed=True 기록 (모든 단계 완료 시)"""
+    """모든 단계가 끝났을 때 session.json에 completed=True를 기록.
+    이후 _find_resumable_session에서 이 세션을 재개 대상에서 제외한다."""
     if _SESSION_DIR is None:
         return
     meta_path = _SESSION_DIR / "session.json"
@@ -168,70 +174,9 @@ def _mark_session_complete() -> None:
         pass
 
 
-# ── TUI 표시용 파이프라인 상태 추적 ─────────────────────────────────────────
-
-_pipeline: dict[str, str] = {
-    "document-analyzer":  "pending",
-    "quiz-generator":     "pending",
-    "quiz-validator":     "pending",
-    "feedback-evaluator": "pending",
-}
-_retry_count: int = 0 # 검증 재시도 횟수
-
-# 파이프라인 단계 정의 (키, 한글 라벨)
-_STEPS = [
-    ("document-analyzer",  "문서 분석"),
-    ("quiz-generator",     "퀴즈 생성"),
-    ("quiz-validator",     "품질 검증"),
-    ("feedback-evaluator", "피드백 생성"),
-]
-
-# # 상태별 아이콘·텍스트 매핑
-_STATUS_FMT = {
-    "pending": ("[dim]○[/dim]",               "[dim]대기[/dim]"),
-    "running": ("[yellow bold]●[/yellow bold]", "[yellow]실행 중...[/yellow]"),
-    "done":    ("[green bold]✓[/green bold]",   "[green]완료[/green]"),
-    "failed":  ("[red bold]✗[/red bold]",       "[red]실패[/red]"),
-    "retry":   ("[yellow bold]↻[/yellow bold]", "[yellow]재시도[/yellow]"),
-    "loaded":  ("[cyan bold]↑[/cyan bold]",     "[cyan]불러옴[/cyan]"),
-}
-
-
-def _print_pipeline():
-    """파이프라인 전체 상태를 Rich 테이블로 출력"""
-    t = Table(
-        box=box.ROUNDED,
-        show_header=False,
-        padding=(0, 1),
-        expand=False,
-        border_style="bright_black",
-        title="[bold]파이프라인[/bold]",
-        title_justify="left",
-    )
-    t.add_column(width=3, no_wrap=True)
-    t.add_column(min_width=14)
-    t.add_column(min_width=16)
-
-    for key, label in _STEPS:
-        st = _pipeline.get(key, "pending")
-        icon, stat_text = _STATUS_FMT.get(st, _STATUS_FMT["pending"])
-        # 검증 단계에서 재시도 중이면 횟수 표시
-        if key == "quiz-validator" and _retry_count > 0 and st in ("running", "retry"):
-            stat_text += f" [dim]({_retry_count}회)[/dim]"
-        t.add_row(icon, label, stat_text)
-
-    console.print(t)
-
-
-def _set_status(agent: str, status: str):
-    """특정 단계의 상태를 갱신하고 파이프라인 테이블을 다시 출력"""
-    _pipeline[agent] = status
-    _print_pipeline()
-    console.print()
-
-
-# ── Subagent helpers ──────────────────────────────────────────────────────────
-# 각 단계를 담당하는 LLM 에이전트 생성·실행 유틸리티
+# ── 서브에이전트 헬퍼 ─────────────────────────────────────────────────────────
+# 각 서브에이전트는 독립된 역할(분석, 생성, 검증, 평가)을 수행하며,
+# 시스템 프롬프트는 ./subagents/{name}.txt에서 로드한다.
 
 def load_prompt(name: str, prompt_dir: str = "./subagents") -> str:
     """./subagents/{name}.txt에서 시스템 프롬프트를 읽어옴"""
@@ -239,14 +184,16 @@ def load_prompt(name: str, prompt_dir: str = "./subagents") -> str:
 
 
 def create_subagent(name: str, model_type: str):
-    """이름과 모델 등급(simple|advanced)으로 서브에이전트 인스턴스 생성"""
+    """서브에이전트 인스턴스 생성.
+    name: 프롬프트 파일명 및 에이전트 식별자
+    model_type: "simple" 또는 "advanced" — 작업 복잡도에 맞춰 선택"""
     return create_deep_agent(
         model=get_model(model_type),
         system_prompt=load_prompt(name),
         name=name,
     )
 
-# 서브에이전트 생성
+# 4개의 서브에이전트 생성
 analyzer_subagent  = create_subagent("document-analyzer",  "simple")
 generator_subagent = create_subagent("quiz-generator",     "advanced")
 validator_subagent = create_subagent("quiz-validator",     "simple")
@@ -254,90 +201,72 @@ evaluator_subagent = create_subagent("feedback-evaluator", "advanced")
 
 
 async def _run_subagent(subagent, prompt: str) -> str:
-    """서브에이전트를 실행하고 응답을 스트리밍 출력 (실패 시 일반 호출(ainvoke)).
-    응답을 JSON으로 파싱 시도 후 반환."""
-    global _total_input_tokens, _total_output_tokens
+    """서브에이전트를 비동기 실행하고 응답 텍스트를 반환.
 
-    console.print("  [dim]생성 중...[/dim]")
-    full_content = ""
-    in_stream = False
+    동작 흐름:
+    1. astream_events로 스트리밍 실행을 시도하여 실시간 출력
+    2. 스트리밍 실패 시 ainvoke로 fallback (일반 호출)
+    3. 토큰 사용량을 전역 카운터에 누적
+    4. 응답을 JSON 파싱 시도 → 성공하면 정규화된 JSON 문자열, 실패하면 원문 반환
+    """
+    global _total_input_tokens, _total_output_tokens
     input_tokens = 0
     output_tokens = 0
 
-    try:
-        # 스트리밍 모드: 토큰 단위로 실시간 출력 <- 대기 시 진행 중인 이벤트가 있다는 것을 보여주기
-        async for event in subagent.astream_events(
-            {"messages": [HumanMessage(prompt)]}, version="v2"
-        ):
-            if event["event"] == "on_chat_model_stream":
-                chunk = event["data"]["chunk"].content
-                if chunk:
-                    if not in_stream:
-                        console.print("  ", end="", highlight=False)
-                        in_stream = True
-                    console.print(chunk, end="", highlight=False)
-                    full_content += chunk
-            elif event["event"] == "on_chat_model_end":
-                usage = event.get("data", {}).get("output", {})
-                if hasattr(usage, "usage_metadata") and usage.usage_metadata:
-                    input_tokens  += usage.usage_metadata.get("input_tokens", 0)
-                    output_tokens += usage.usage_metadata.get("output_tokens", 0)
-        if in_stream:
-            console.print()
-    except Exception:
-        # 스트리밍 실패 시 일반 호출로 폴백
-        result = await subagent.ainvoke({"messages": [HumanMessage(prompt)]})
-        full_content = result["messages"][-1].content
-        if hasattr(result["messages"][-1], "usage_metadata") and result["messages"][-1].usage_metadata:
-            input_tokens  = result["messages"][-1].usage_metadata.get("input_tokens", 0)
-            output_tokens = result["messages"][-1].usage_metadata.get("output_tokens", 0)
-        console.print(
-            f"  [dim]{full_content[:120]}{'...' if len(full_content) > 120 else ''}[/dim]"
-        )
+
+    print("  생성 중...")
+    result = await subagent.ainvoke({"messages": [HumanMessage(prompt)]})
+    full_content = result["messages"][-1].content
+    print(f"  {full_content[:120]}{'...' if len(full_content) > 120 else ''}") # 생성 미리보기
+
+    # 토큰 관리
+    if hasattr(result["messages"][-1], "usage_metadata") and result["messages"][-1].usage_metadata:
+        input_tokens  = result["messages"][-1].usage_metadata.get("input_tokens", 0)
+        output_tokens = result["messages"][-1].usage_metadata.get("output_tokens", 0)
 
     _total_input_tokens  += input_tokens
     _total_output_tokens += output_tokens
+
     if input_tokens or output_tokens:
-        console.print(
-            f"  [dim]input: {input_tokens:,} / output: {output_tokens:,} 토큰[/dim]"
-        )
+        print(f"  input: {input_tokens:,} / output: {output_tokens:,} 토큰")
+    print()
 
-    console.print()
-
-    # 응답을 JSON으로 정규화 시도
+    # JSON 정규화 시도 — LLM 응답이 유효한 JSON이면 정규화된 문자열로,
+    # 아니면 원문 그대로 반환 (후속 단계에서 재파싱 시도 가능)
     try:
         return json.dumps(_parse_json(full_content), ensure_ascii=False)
     except (json.JSONDecodeError, ValueError):
-        return full_content # JSON 아니면 원문 그대로 반환 -> (저장 시 포맷 오류)
+        return full_content
 
 
-# ── Tools ─────────────────────────────────────────────────────────────────────
+# ── 도구(Tool) 정의 ───────────────────────────────────────────────────────────
+# LangChain의 @tool 데코레이터로 정의된 함수들은
+# 메인 오케스트레이터 에이전트가 필요에 따라 호출할 수 있는 도구가 된다.
 
 @tool
 async def analyze_document(material: str) -> str:
-    """학습 자료를 분석하여 concepts, topic, difficulty 등을 추출"""
-    _set_status("document-analyzer", "running") # TUI 상태 변환
+    """학습 자료를 분석하여 주제(topic), 핵심 개념(concepts),
+    난이도(difficulty), 언어 등의 메타데이터를 추출.
+    파이프라인의 첫 번째 단계."""
+
+    print("\n[문서 분석] 실행 중...")
 
     result = await _run_subagent(
         analyzer_subagent,
         f"다음 학습 자료를 분석한 결과를 반환하세요.\n<material>\n{material}\n</material>\n",
-    ) # 
+    )
 
-    _set_status("document-analyzer", "done") # TUI 상태 변환
-    _save_artifact("analysis", result) # 결과 저장
+    print("[문서 분석] 완료")
 
-    # TUI 출력
+    _save_artifact("analysis", result) # 저장
+
+    # 분석 결과 요약 출력
     try:
         d = json.loads(result)
-        console.print(
-            f"  [dim]주제:[/dim] {d.get('topic', '?')}  "
-            f"[dim]난이도:[/dim] {d.get('difficulty', '?')}  "
-            f"[dim]개념 수:[/dim] {len(d.get('concepts', []))}",
-            highlight=False,
-        )
-        console.print()
+        print(f"  주제: {d.get('topic', '?')}  난이도: {d.get('difficulty', '?')}  개념 수: {len(d.get('concepts', []))}")
+        print()
     except Exception:
-        pass # TUI에 출력하지 않고 넘어가기
+        pass
 
     return result
 
@@ -348,9 +277,12 @@ async def generate_quiz(
     analysis: str,
     validator_feedback: Optional[str] = None,
 ) -> str:
-    """학습 자료 및 분석 결과를 이용하여 Quiz 문항 및 답안 생성"""
-    _set_status("quiz-generator", "running")
+    """학습 자료 + 분석 결과를 기반으로 퀴즈(문항 + 정답)를 JSON으로 생성.
+    validator_feedback가 주어지면 이전 검증에서 지적된 문제를 반영하여 재생성."""
 
+    print("\n[퀴즈 생성] 실행 중...")
+
+    # 검증 실패 피드백이 있으면 프롬프트에 포함하여 품질 개선 유도
     feedback_block = (
         f"\n<validator_feedback>\n{validator_feedback}\n</validator_feedback>\n"
         if validator_feedback else ""
@@ -362,16 +294,15 @@ async def generate_quiz(
         + feedback_block
     )
     result = await _run_subagent(generator_subagent, prompt)
-    _set_status("quiz-generator", "done")
+
+    print("[퀴즈 생성] 완료")
+
     _save_artifact("quiz", result)
 
     try:
         d = json.loads(result)
-        console.print(
-            f"  [dim]생성된 문항 수:[/dim] {len(d.get('quiz', []))}",
-            highlight=False,
-        )
-        console.print()
+        print(f"  생성된 문항 수: {len(d.get('quiz', []))}")
+        print()
     except Exception:
         pass
 
@@ -380,10 +311,11 @@ async def generate_quiz(
 
 @tool
 async def validate_quiz(quiz: str, analysis: str) -> str:
-    """퀴즈 품질 검증 및 PASS/FAIL 반환"""
-    global _retry_count
-    _retry_count += 1
-    _set_status("quiz-validator", "running")
+    """생성된 퀴즈의 품질을 0~100 점수로 검증하고 PASS/FAIL 판정.
+    FAIL이면 regeneration_instruction(재생성 지침)을 함께 반환하여
+    오케스트레이터가 generate_quiz를 재호출할 수 있게 한다."""
+
+    print("\n[품질 검증] 실행 중...")
 
     result = await _run_subagent(
         validator_subagent,
@@ -399,23 +331,14 @@ async def validate_quiz(quiz: str, analysis: str) -> str:
         avg = sum(scores.values()) / len(scores) if scores else 0
 
         if passed:
-            _set_status("quiz-validator", "done")
+            print(f"[품질 검증] 완료  평균 점수: {avg:.0f}  PASS")
             _save_artifact("validation", result)
-            console.print(
-                f"  [dim]평균 점수:[/dim] {avg:.0f}  [green bold]PASS[/green bold]",
-                highlight=False,
-            )
         else:
-            _pipeline["quiz-validator"] = "retry"
-            _print_pipeline()
-            console.print()
-            console.print(
-                f"  [dim]평균 점수:[/dim] {avg:.0f}  [red bold]FAIL[/red bold] → 재생성",
-                highlight=False,
-            )
-        console.print()
+            # FAIL인 경우 아티팩트를 저장하지 않음 — 재생성 후 새 퀴즈로 대체 예정
+            print(f"[품질 검증] FAIL  평균 점수: {avg:.0f} → 재생성")
+        print()
     except Exception:
-        _set_status("quiz-validator", "done")
+        print("[품질 검증] 완료")
         _save_artifact("validation", result)
 
     return result
@@ -423,7 +346,10 @@ async def validate_quiz(quiz: str, analysis: str) -> str:
 
 @tool
 def collect_user_answers(quiz_json: str) -> str:
-    """퀴즈를 화면에 표시하고 사용자 답변을 수집"""
+    """퀴즈를 터미널에 표시하고 사용자로부터 답변을 입력받아 수집.
+    동기 함수 — input()으로 사용자 입력을 대기한다.
+    반환값: {"문항번호": "사용자답변", ...} 형태의 JSON 문자열."""
+
     try:
         data = json.loads(quiz_json)
     except json.JSONDecodeError:
@@ -432,38 +358,35 @@ def collect_user_answers(quiz_json: str) -> str:
     questions = data.get("quiz", [])
     answers: dict[str, str] = {}
 
-    console.print()
-    console.rule("[bold cyan]퀴즈[/bold cyan]")
-    console.print()
+    print()
+    print("=" * 40)
+    print("퀴즈")
+    print("=" * 40)
+    print()
 
     for q in questions:
         no      = q.get("no", "?")
-        q_type  = q.get("type", "short_answer")
+        q_type  = q.get("type", "short_answer")  # multiple_choice | true_false | short_answer
         question = q.get("question", "")
         options  = q.get("options", [])
 
-        console.print(Panel(
-            f"[bold]Q{no}.[/bold]  {question}",
-            subtitle=f"[dim]{q_type}[/dim]",
-            subtitle_align="right",
-            border_style="blue",
-            padding=(0, 1),
-        ))
+        print(f"Q{no}. {question}  [{q_type}]")
 
+        # 문항 유형에 따라 입력 방식 분기
         if q_type == "multiple_choice" and options:
             for opt in options:
-                console.print(f"   {opt}")
-            console.print()
-            ans = Prompt.ask("   [cyan]답 (A/B/C/D)[/cyan]").strip().upper()
+                print(f"   {opt}")
+            print()
+            ans = input("   답 (A/B/C/D): ").strip().upper()
         elif q_type == "true_false":
-            ans = Prompt.ask("   [cyan]답 (O/X)[/cyan]").strip().upper()
-        else:
-            ans = Prompt.ask("   [cyan]답[/cyan]").strip()
+            ans = input("   답 (O/X): ").strip().upper()
+        else:  # short_answer 등
+            ans = input("   답: ").strip()
 
         answers[str(no)] = ans
-        console.print()
+        print()
 
-    console.rule()
+    print("=" * 40)
     result = json.dumps(answers, ensure_ascii=False)
     _save_artifact("user_answers", result)
     return result
@@ -476,9 +399,13 @@ async def evaluate_feedback(
     material: str,
     analysis: str,
 ) -> str:
-    """사용자 답변 채점 및 학습 피드백 생성"""
-    _set_status("feedback-evaluator", "running")
+    """사용자 답변을 정답과 대조하여 채점하고,
+    학습 자료·분석 결과를 참고하여 개념별 맞춤 피드백을 생성.
+    출력: item_results(문항별 정오), weak_areas, strong_areas, next_study 등."""
 
+    print("\n[피드백 생성] 실행 중...")
+
+    # 퀴즈 JSON에서 문항(quiz)과 정답(answers)을 분리하여 전달
     try:
         quiz_data = _parse_json(quiz_json)
     except (json.JSONDecodeError, ValueError):
@@ -498,24 +425,30 @@ async def evaluate_feedback(
         f"<analysis>\n{analysis}\n</analysis>\n"
     )
     result = await _run_subagent(evaluator_subagent, prompt)
-    _set_status("feedback-evaluator", "done")
+
+    print("[피드백 생성] 완료")
     _save_artifact("feedback", result)
     return result
 
 
 @tool
 def display_result(feedback_json: str) -> str:
-    """채점 결과와 학습 피드백을 TUI로 출력. 모든 분석이 끝난 후 반드시 호출."""
+    """채점 결과와 학습 피드백을 사람이 읽기 좋은 형태로 터미널에 출력.
+    파이프라인의 마지막 단계 — 호출 후 세션을 완료(completed=True)로 표시한다."""
     try:
         data = _parse_json(feedback_json)
     except (json.JSONDecodeError, ValueError):
-        console.print(feedback_json)
+        # JSON 파싱 실패 시 원문 그대로 출력
+        print(feedback_json)
         return "출력 완료 (JSON 파싱 실패 — 원문 출력)"
 
-    console.print()
-    console.rule("[bold cyan]결과[/bold cyan]")
-    console.print()
+    print()
+    print("=" * 40)
+    print("결과")
+    print("=" * 40)
+    print()
 
+    # ── 총점 계산 ──
     score = data.get("score")
     if not score:
         items = data.get("item_results", [])
@@ -524,63 +457,49 @@ def display_result(feedback_json: str) -> str:
             score = f"{correct_count}/{len(items)}"
         else:
             score = "?"
-    console.print(Panel(
-        f"[bold cyan]점수  {score}[/bold cyan]",
-        border_style="cyan",
-        expand=False,
-        padding=(0, 3),
-    ))
-    console.print()
+    print(f"점수: {score}")
+    print()
 
+    # ── 문항별 정답표 출력 ──
     items = data.get("item_results", [])
     if items:
-        t = Table(
-            title="[bold]문항별 결과[/bold]",
-            box=box.SIMPLE_HEAD,
-            border_style="bright_black",
-            padding=(0, 1),
-        )
-        t.add_column("번호", width=5, justify="center")
-        t.add_column("정오", width=4, justify="center")
-        t.add_column("정답", style="green", min_width=20)
-        t.add_column("내 답", style="dim", min_width=20)
-
+        print("문항별 결과:")
+        print(f"  {'번호':^4}  {'정답 여부':^4}  {'정답':<20}  {'내 답':<20}")
+        print(f"  {'-'*4}  {'-'*4}  {'-'*20}  {'-'*20}")
         for item in items:
             correct = item.get("correct", False)
-            icon = "[green]✓[/green]" if correct else "[red]✗[/red]"
+            icon = "O" if correct else "X"
             correct_ans = str(item.get("correct_answer", ""))
-            user_ans    = str(item.get("user_answer", "")) if not correct else "[dim]-[/dim]"
-            t.add_row(str(item.get("no", "?")), icon, correct_ans, user_ans)
+            user_ans    = str(item.get("user_answer", "")) if not correct else "-"
+            print(f"  {str(item.get('no', '?')):^4}  {icon:^4}  {correct_ans:<20}  {user_ans:<20}")
+        print()
 
-        console.print(t)
-        console.print()
-
+    # ── 강점/약점 개념 요약 ──
     weak   = data.get("weak_areas", [])
     strong = data.get("strong_areas", [])
 
     if weak:
-        tags = "  ".join(f"[red]{w['concept_name']}[/red]" for w in weak)
-        console.print(f"[bold]취약 개념:[/bold]  {tags}")
+        tags = ", ".join(w['concept_name'] for w in weak)
+        print(f"취약 개념: {tags}")
     if strong:
-        tags = "  ".join(f"[green]{s['concept_name']}[/green]" for s in strong)
-        console.print(f"[bold]강한 개념:[/bold]  {tags}")
+        tags = ", ".join(s['concept_name'] for s in strong)
+        print(f"강한 개념: {tags}")
 
+    # ── 후속 학습 추천 ──
     next_study = data.get("next_study", "")
     if next_study:
-        console.print()
-        console.print(Panel(
-            next_study,
-            title="[bold yellow]학습 추천[/bold yellow]",
-            border_style="yellow",
-            padding=(0, 1),
-        ))
+        print()
+        print("학습 추천:")
+        print(next_study)
 
-    console.print()
-    _mark_session_complete()
+    print()
+    _mark_session_complete()  # 세션 완료 표시 — 이후 재개 대상에서 제외됨
     return "출력 완료"
 
 
-# ── Orchestrator ──────────────────────────────────────────────────────────────
+# ── 메인 오케스트레이터 에이전트 ──────────────────────────────────────────────
+# 위에서 정의한 6개의 도구를 사용하여 전체 파이프라인을 자율적으로 조율.
+# 흐름: analyze → generate → validate → (FAIL이면 재생성) → collect → evaluate → display
 
 main_agent = create_deep_agent(
     model=get_model("advanced"),
@@ -610,7 +529,7 @@ main_agent = create_deep_agent(
 
 **퀴즈 품질 관리**
 - validate_quiz 결과가 FAIL이면 regeneration_instruction을 validator_feedback으로 삼아 generate_quiz를 재호출한다.
-- 재시도는 최대 1회까지 허용한다. 2회 후에도 FAIL이면 가장 최근 퀴즈를 사용한다.
+- 재시도는 사용자 메시지에 명시된 횟수까지 허용한다. 횟수 초과 후에도 FAIL이면 가장 최근 퀴즈를 사용한다.
 - 재시도 시 이전 피드백을 반드시 반영해야 한다.
 
 **오류 처리**
@@ -631,86 +550,74 @@ main_agent = create_deep_agent(
 )
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
+# ── 프로그램 진입점 ───────────────────────────────────────────────────────────
 
 async def main():
-    parser = argparse.ArgumentParser(description="Study Agent")
-    parser.add_argument("material_file", help="학습 자료 파일 경로")
-    args = parser.parse_args()
-
-    material_path = args.material_file
+    # 자료 불러오기
+    material_path = _args.material_file
     material = Path(material_path).read_text(encoding="utf-8")
+    
+    # 출력
+    print("\nStudy Agent  AI 기반 학습 퀴즈 생성기")
+    print(f"자료: {material_path}\n")
 
-    # 타이틀 배너 출력
-    console.print()
-    console.print(Panel(
-        "[bold cyan]Study Agent[/bold cyan]  [dim]AI 기반 학습 퀴즈 생성기[/dim]\n"
-        f"[dim]자료: {material_path}[/dim]",
-        border_style="cyan",
-        padding=(0, 2),
-        expand=False,
-    ))
-    console.print()
-
-    # ── 이전 미완료 세션 탐색 및 재개 여부 확인 ──────────────────────────────
-    # API 비용 절약을 위해, 같은 자료에 대한 미완료 세션이 있으면 중간 결과를 재활용
+    # ── 이전 미완료 세션 탐색 및 재개 여부 확인 ──
+    # 중단된 세션이 있으면 API 호출 비용을 아끼기 위해 중간 결과 재활용.
     resume_dir = _find_resumable_session(material_path)
     resume_context = ""
 
     if resume_dir:
-        console.print(Panel(
-            f"[yellow]미완료 세션이 있습니다:[/yellow] [dim]{resume_dir}[/dim]\n"
-            f"저장된 파일: {', '.join(p.name for p in resume_dir.glob('*.json') if p.name != 'session.json')}",
-            border_style="yellow",
-            padding=(0, 1),
-            expand=False,
-        ))
-        console.print()
+        saved_files = ', '.join(p.name for p in resume_dir.glob('*.json') if p.name != 'session.json')
+        print(f"미완료 세션이 있습니다: {resume_dir}")
+        print(f"저장된 파일: {saved_files}")
+        print()
 
-        if Confirm.ask("  이어서 진행할까요?", default=True):
+        ans = input("  이어서 진행할까요? [Y/n]: ").strip().lower()
+        if ans in ("", "y", "yes"):
             _resume_session(resume_dir)
 
-            # 저장된 중간 결과 로드
+            # 이전에 저장된 분석 결과와 퀴즈를 로드
             saved_analysis = _load_artifact(resume_dir, "analysis")
             saved_quiz     = _load_artifact(resume_dir, "quiz")
 
+            # 오케스트레이터에게 전달할 재개 컨텍스트
             if saved_analysis:
-                _pipeline["document-analyzer"] = "loaded"
                 resume_context += f"\n<saved_analysis>\n{saved_analysis}\n</saved_analysis>\n"
             if saved_quiz:
-                _pipeline["quiz-generator"]  = "loaded"
-                _pipeline["quiz-validator"] = "loaded"
                 resume_context += f"\n<saved_quiz>\n{saved_quiz}\n</saved_quiz>\n"
         else:
-            _init_session(material_path) # 결과 저장 directory & 메타데이터만 생성. 실행 단계는 orchestrator가 자동으로 실행
+            # 사용자가 재개를 거부하면 새 세션 시작
+            _init_session(material_path)
     else:
         _init_session(material_path)
 
-    _print_pipeline()
-    console.print()
-
-    # ── 오케스트레이터에게 전달할 메시지 구성 ─────────────────────────────────
+    # ── 오케스트레이터에게 전달할 최종 메시지 구성 ──
+    difficulty_str = "자료에서 자동 판단" if _args.difficulty == "auto" else _args.difficulty
+    question_types = [t.strip() for t in _args.question_types.split(",")]
+    quiz_settings = (
+        f"문항 수: {_args.num_questions}개 / "
+        f"난이도: {difficulty_str} / "
+        f"문항 유형: {', '.join(question_types)} / "
+        f"검증 실패 시 최대 재생성 횟수: {_args.max_retries}회"
+    )
     base_message = (
-        "다음 학습 자료로 퀴즈를 생성하고, 사용자 답변을 채점해 주세요.\n"
+        f"다음 학습 자료로 퀴즈를 생성하고, 사용자 답변을 채점해 주세요.\n"
+        f"퀴즈 설정: {quiz_settings}\n"
         f"<material>\n{material}\n</material>"
     )
     if resume_context:
-        # 재개 시: 저장된 중간 결과를 메시지에 포함하여 오케스트레이터가 건너뛸 수 있게 함
         base_message += (
             "\n\n이전 세션에서 저장된 중간 결과가 있습니다. "
             "저장된 데이터를 그대로 활용하고 남은 단계부터 진행하세요."
             + resume_context
         )
 
-    # 오케스트레이터 실행 — 내부적으로 도구들을 자율 호출
+    # 오케스트레이터 실행
     await main_agent.ainvoke({"messages": [HumanMessage(base_message)]})
 
+    # 세션 종료 후 총 토큰 사용량 출력
     if _total_input_tokens or _total_output_tokens:
-        console.print()
-        console.print(
-            f"  [dim]총 사용 토큰  input: {_total_input_tokens:,} / output: {_total_output_tokens:,}[/dim]"
-        )
-        console.print()
+        print(f"\n  총 사용 토큰  input: {_total_input_tokens:,} / output: {_total_output_tokens:,}\n")
 
 
 if __name__ == "__main__":
