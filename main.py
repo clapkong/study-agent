@@ -11,49 +11,10 @@ from deepagents import create_deep_agent
 from langchain_core.messages import HumanMessage
 from langchain_core.tools import tool
 
-# .env 파일에서 API 키 등 환경변수 로드
 load_dotenv()
 
-def _parse_args():
-    parser = argparse.ArgumentParser(description="Study Agent — AI 기반 학습 퀴즈 생성기")
-    parser.add_argument("material_file", help="학습 자료 파일 경로")
-    parser.add_argument(
-        "--provider", choices=["claude", "openai"], default="claude",
-        help="AI 제공자 (기본값: claude)",
-    )
-    parser.add_argument(
-        "--output-dir", default="./outputs", metavar="PATH",
-        help="결과 저장 디렉터리 (기본값: ./outputs)",
-    )
-    parser.add_argument(
-        "--num-questions", type=int, default=5, metavar="N",
-        help="생성할 문항 수 (기본값: 5)",
-    )
-    parser.add_argument(
-        "--difficulty", choices=["auto", "easy", "medium", "hard"], default="auto",
-        help="난이도 — auto면 자료에서 자동 판단 (기본값: auto)",
-    )
-    parser.add_argument(
-        "--question-types", default="multiple_choice,true_false,short_answer", metavar="TYPES",
-        help="문항 유형, 콤마 구분 (기본값: multiple_choice,true_false,short_answer)",
-    )
-    parser.add_argument(
-        "--max-retries", type=int, default=1, metavar="N",
-        help="퀴즈 검증 실패 시 최대 재생성 횟수 (기본값: 1)",
-    )
-    return parser.parse_args()
 
-
-# 모듈 로드 시 바로 파싱 → 서브에이전트 생성 전에 MODEL/OUTPUT_DIR 확정
-_args = _parse_args()
-
-# 사용할 AI 제공자 및 출력 경로
-MODEL = _args.provider
-_OUTPUT_DIR = _args.output_dir
-
-# 세션 전체 누적 토큰 사용량 추적
-_total_input_tokens: int = 0
-_total_output_tokens: int = 0
+# ── 상수 ──────────────────────────────────────────────────────────────────────
 
 # AI 제공자별 모델 매핑 (simple | advanced)
 MODELS_MAP = {
@@ -67,9 +28,12 @@ MODELS_MAP = {
     },
 }
 
+
+# ── 유틸 함수 ──────────────────────────────────────────────────────────────────
+
 def get_model(model_type: str) -> str:
-    """MODEL 전역변수에 따라 실제 모델 ID를 반환."""
-    model_map = MODELS_MAP.get(MODEL, MODELS_MAP["claude"])
+    """_MODEL 전역변수에 따라 실제 모델 ID를 반환."""
+    model_map = MODELS_MAP.get(_MODEL, MODELS_MAP["claude"])
     return model_map.get(model_type, model_map["advanced"])
 
 def _parse_json(text: str) -> dict:
@@ -79,12 +43,16 @@ def _parse_json(text: str) -> dict:
             return json.loads(match.group(1))
         except json.JSONDecodeError:
             pass
-    obj, _ = json.JSONDecoder().raw_decode(text, text.find('{')) # 에러 시 에러 전파
+    obj, _ = json.JSONDecoder().raw_decode(text, text.find('{'))  # 에러 시 에러 전파
     return obj
+
+def load_prompt(name: str, prompt_dir: str = "./subagents") -> str:
+    """./subagents/{name}.txt에서 시스템 프롬프트를 읽어옴"""
+    return (Path(prompt_dir) / f"{name}.txt").read_text(encoding="utf-8")
 
 
 # ── 세션 관리 ─────────────────────────────────────────────────────────────────
-# 각 단계(분석, 퀴즈 생성, 검증 등)의 결과를 세션 디렉터리에 JSON으로 보관. 
+# 각 단계(분석, 퀴즈 생성, 검증 등)의 결과를 세션 디렉터리에 JSON으로 보관.
 # 중단된 세션이 있으면 API 호출 비용을 아끼기 위해 중간 결과 재활용.
 
 class Session:
@@ -169,17 +137,9 @@ class Session:
         return cls.new(material_path, output_dir), ""
 
 
-_session: Optional[Session] = None  # 현재 활성 세션
-
-
-# ── 서브에이전트 헬퍼 ─────────────────────────────────────────────────────────
+# ── 서브에이전트 헬퍼 ──────────────────────────────────────────────────────────
 # 각 서브에이전트는 독립된 역할(분석, 생성, 검증, 평가)을 수행하며,
 # 시스템 프롬프트는 ./subagents/{name}.txt에서 로드한다.
-
-def load_prompt(name: str, prompt_dir: str = "./subagents") -> str:
-    """./subagents/{name}.txt에서 시스템 프롬프트를 읽어옴"""
-    return (Path(prompt_dir) / f"{name}.txt").read_text(encoding="utf-8")
-
 
 def create_subagent(name: str, model_type: str):
     """서브에이전트 인스턴스 생성.
@@ -191,31 +151,22 @@ def create_subagent(name: str, model_type: str):
         name=name,
     )
 
-# 4개의 서브에이전트 생성
-analyzer_subagent  = create_subagent("document-analyzer",  "simple")
-generator_subagent = create_subagent("quiz-generator",     "advanced")
-validator_subagent = create_subagent("quiz-validator",     "simple")
-evaluator_subagent = create_subagent("feedback-evaluator", "advanced")
-
-
 async def _run_subagent(subagent, prompt: str) -> str:
     """서브에이전트를 비동기 실행하고 응답 텍스트를 반환.
 
     동작 흐름:
-    1. astream_events로 스트리밍 실행을 시도하여 실시간 출력
-    2. 스트리밍 실패 시 ainvoke로 fallback (일반 호출)
-    3. 토큰 사용량을 전역 카운터에 누적
-    4. 응답을 JSON 파싱 시도 → 성공하면 정규화된 JSON 문자열, 실패하면 원문 반환
+    1. ainvoke로 실행
+    2. 토큰 사용량을 전역 카운터에 누적
+    3. 응답을 JSON 파싱 시도 → 성공하면 정규화된 JSON 문자열, 실패하면 원문 반환
     """
     global _total_input_tokens, _total_output_tokens
     input_tokens = 0
     output_tokens = 0
 
-
     print("  생성 중...")
     result = await subagent.ainvoke({"messages": [HumanMessage(prompt)]})
     full_content = result["messages"][-1].content
-    print(f"  {full_content[:120]}{'...' if len(full_content) > 120 else ''}") # 생성 미리보기
+    print(f"  {full_content[:120]}{'...' if len(full_content) > 120 else ''}")  # 생성 미리보기
 
     # 토큰 관리
     if hasattr(result["messages"][-1], "usage_metadata") and result["messages"][-1].usage_metadata:
@@ -235,6 +186,20 @@ async def _run_subagent(subagent, prompt: str) -> str:
         return json.dumps(_parse_json(full_content), ensure_ascii=False)
     except (json.JSONDecodeError, ValueError):
         return full_content
+
+
+# ── 모듈 상태 ──────────────────────────────────────────────────────────────────
+# @tool 함수들이 참조하는 전역 변수. main()에서 초기화된다.
+
+_MODEL: str = "claude"
+_total_input_tokens: int = 0
+_total_output_tokens: int = 0
+_session: Optional[Session] = None
+
+analyzer_subagent  = None  # main()에서 초기화
+generator_subagent = None
+validator_subagent = None
+evaluator_subagent = None
 
 
 # ── 도구(Tool) 정의 ───────────────────────────────────────────────────────────
@@ -259,7 +224,6 @@ async def analyze_document(material: str) -> str:
     if _session:
         _session.save("analysis", result)
 
-    # 분석 결과 요약 출력
     try:
         d = json.loads(result)
         print(f"  주제: {d.get('topic', '?')}  난이도: {d.get('difficulty', '?')}  개념 수: {len(d.get('concepts', []))}")
@@ -367,8 +331,8 @@ def collect_user_answers(quiz_json: str) -> str:
     print()
 
     for q in questions:
-        no      = q.get("no", "?")
-        q_type  = q.get("type", "short_answer")  # multiple_choice | true_false | short_answer
+        no       = q.get("no", "?")
+        q_type   = q.get("type", "short_answer")  # multiple_choice | true_false | short_answer
         question = q.get("question", "")
         options  = q.get("options", [])
 
@@ -502,21 +466,62 @@ def display_result(feedback_json: str) -> str:
     return "출력 완료"
 
 
-# ── 메인 오케스트레이터 에이전트 ──────────────────────────────────────────────
-# 위에서 정의한 6개의 도구를 사용하여 전체 파이프라인을 자율적으로 조율.
-# 흐름: analyze → generate → validate → (FAIL이면 재생성) → collect → evaluate → display
+# ── 진입점 ────────────────────────────────────────────────────────────────────
 
-main_agent = create_deep_agent(
-    model=get_model("advanced"),
-    tools=[
-        analyze_document,
-        generate_quiz,
-        validate_quiz,
-        collect_user_answers,
-        evaluate_feedback,
-        display_result,
-    ],
-    system_prompt="""당신은 학습 퀴즈 세션 오케스트레이터입니다.
+def _parse_args():
+    parser = argparse.ArgumentParser(description="Study Agent — AI 기반 학습 퀴즈 생성기")
+    parser.add_argument("material_file", help="학습 자료 파일 경로")
+    parser.add_argument(
+        "--provider", choices=["claude", "openai"], default="claude",
+        help="AI 제공자 (기본값: claude)",
+    )
+    parser.add_argument(
+        "--output-dir", default="./outputs", metavar="PATH",
+        help="결과 저장 디렉터리 (기본값: ./outputs)",
+    )
+    parser.add_argument(
+        "--num-questions", type=int, default=5, metavar="N",
+        help="생성할 문항 수 (기본값: 5)",
+    )
+    parser.add_argument(
+        "--difficulty", choices=["auto", "easy", "medium", "hard"], default="auto",
+        help="난이도 — auto면 자료에서 자동 판단 (기본값: auto)",
+    )
+    parser.add_argument(
+        "--question-types", default="multiple_choice,true_false,short_answer", metavar="TYPES",
+        help="문항 유형, 콤마 구분 (기본값: multiple_choice,true_false,short_answer)",
+    )
+    parser.add_argument(
+        "--max-retries", type=int, default=1, metavar="N",
+        help="퀴즈 검증 실패 시 최대 재생성 횟수 (기본값: 1)",
+    )
+    return parser.parse_args()
+
+
+async def main():
+    global _MODEL, _session, analyzer_subagent, generator_subagent, validator_subagent, evaluator_subagent
+
+    args = _parse_args()
+    _MODEL = args.provider
+
+    analyzer_subagent  = create_subagent("document-analyzer",  "simple")
+    generator_subagent = create_subagent("quiz-generator",     "advanced")
+    validator_subagent = create_subagent("quiz-validator",     "simple")
+    evaluator_subagent = create_subagent("feedback-evaluator", "advanced")
+
+    # 오케스트레이터 초기화
+    # 흐름: analyze → generate → validate → (FAIL이면 재생성) → collect → evaluate → display
+    main_agent = create_deep_agent(
+        model=get_model("advanced"),
+        tools=[
+            analyze_document,
+            generate_quiz,
+            validate_quiz,
+            collect_user_answers,
+            evaluate_feedback,
+            display_result,
+        ],
+        system_prompt="""당신은 학습 퀴즈 세션 오케스트레이터입니다.
 사용자에게 학습 자료 기반 퀴즈를 출제하고, 답변을 채점하며, 맞춤형 피드백을 제공하는 것이 목표입니다.
 
 ## 사용 가능한 도구
@@ -551,33 +556,27 @@ main_agent = create_deep_agent(
 - 저장된 결과를 그대로 사용하고 그 다음 단계부터 진행한다.
 - 저장된 퀴즈가 있으면 validate_quiz와 generate_quiz는 건너뛰고 collect_user_answers부터 시작한다.
 """,
-    name="main-orchestrator",
-)
+        name="main-orchestrator",
+    )
 
-
-# ── 프로그램 진입점 ───────────────────────────────────────────────────────────
-
-async def main():
     # 자료 불러오기
-    material_path = _args.material_file
+    material_path = args.material_file
     material = Path(material_path).read_text(encoding="utf-8")
-    
-    # 출력
+
     print("\nStudy Agent  AI 기반 학습 퀴즈 생성기")
     print(f"자료: {material_path}\n")
 
-    # ── 세션 탐색 · 재개 여부 확인 · 아티팩트 로드 ──
-    global _session
-    _session, resume_context = Session.resolve(material_path, _OUTPUT_DIR)
+    # 세션 탐색 · 재개 여부 확인 · 아티팩트 로드
+    _session, resume_context = Session.resolve(material_path, args.output_dir)
 
-    # ── 오케스트레이터에게 전달할 최종 메시지 구성 ──
-    difficulty_str = "자료에서 자동 판단" if _args.difficulty == "auto" else _args.difficulty
-    question_types = [t.strip() for t in _args.question_types.split(",")]
+    # 오케스트레이터에게 전달할 최종 메시지 구성
+    difficulty_str = "자료에서 자동 판단" if args.difficulty == "auto" else args.difficulty
+    question_types = [t.strip() for t in args.question_types.split(",")]
     quiz_settings = (
-        f"문항 수: {_args.num_questions}개 / "
+        f"문항 수: {args.num_questions}개 / "
         f"난이도: {difficulty_str} / "
         f"문항 유형: {', '.join(question_types)} / "
-        f"검증 실패 시 최대 재생성 횟수: {_args.max_retries}회"
+        f"검증 실패 시 최대 재생성 횟수: {args.max_retries}회"
     )
     base_message = (
         f"다음 학습 자료로 퀴즈를 생성하고, 사용자 답변을 채점해 주세요.\n"
