@@ -101,6 +101,8 @@ python main.py <학습자료파일>
 # 예시
 python main.py test_files/biology.txt
 ```
+## 실행 결과
+<iframe width="560" height="315" src="https://www.youtube.com/embed/jGcoyYbuI9U" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen></iframe>
 
 ## 모델 구성
 
@@ -108,3 +110,5 @@ python main.py test_files/biology.txt
 |------|--------|--------|
 | 오케스트레이터, 퀴즈 생성, 피드백 생성 | claude-sonnet-4-6 | gpt-4o |
 | 문서 분석, 퀴즈 품질 검증 | claude-haiku-4-5 | gpt-4o-mini |
+
+
