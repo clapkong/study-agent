@@ -101,8 +101,7 @@ python main.py <학습자료파일>
 # 예시
 python main.py test_files/biology.txt
 ```
-## 실행 결과
-[![Video Label](http://img.youtube.com/vi/jGcoyYbuI9U/0.jpg)](https://youtu.be/jGcoyYbuI9U)
+## 실행 결과 ([🔗 YouTube 바로가기](https://youtu.be/jGcoyYbuI9U))
 
 ## 모델 구성
 
