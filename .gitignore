@@ -9,5 +9,9 @@ wheels/
 # Virtual environments
 .venv
 
-# IDK category
+# API Keys
 .env
+
+# claude files
+CLAUDE.md
+.claudeignore
