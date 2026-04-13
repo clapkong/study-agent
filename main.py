@@ -14,7 +14,6 @@ from langchain_core.tools import tool
 # .env 파일에서 API 키 등 환경변수 로드
 load_dotenv()
 
-
 def _parse_args():
     parser = argparse.ArgumentParser(description="Study Agent — AI 기반 학습 퀴즈 생성기")
     parser.add_argument("material_file", help="학습 자료 파일 경로")
@@ -84,94 +83,93 @@ def _parse_json(text: str) -> dict:
     return obj
 
 
-# ── 중간 결과(아티팩트) 영속 저장 ─────────────────────────────────────────────
-# 각 단계(분석, 퀴즈 생성, 검증 등)의 결과를 세션 디렉터리에 JSON으로 보관하여
-# 세션 중단 후 재개 시 이전 결과를 재활용할 수 있게 한다.
+# ── 세션 관리 ─────────────────────────────────────────────────────────────────
+# 각 단계(분석, 퀴즈 생성, 검증 등)의 결과를 세션 디렉터리에 JSON으로 보관. 
+# 중단된 세션이 있으면 API 호출 비용을 아끼기 위해 중간 결과 재활용.
 
-_SESSION_DIR: Optional[Path] = None  # 현재 세션의 디렉터리 경로
+class Session:
+    def __init__(self, path: Path):
+        self.path = path
 
-def _save_artifact(name: str, content: str) -> None:
-    """중간 결과를 세션 디렉터리에 {name}.json 파일로 저장"""
-    if _SESSION_DIR is None:
-        return
-    path = _SESSION_DIR / f"{name}.json"
-    path.write_text(content, encoding="utf-8")
-    print(f"  저장됨 → {path}")
-    print()
+    def save(self, name: str, content: str) -> None:
+        """중간 결과를 {name}.json으로 저장"""
+        p = self.path / f"{name}.json"
+        p.write_text(content, encoding="utf-8")
+        print(f"  저장됨 → {p}\n")
 
+    def load(self, name: str) -> Optional[str]:
+        """저장된 아티팩트를 읽어옴. 없으면 None 반환."""
+        p = self.path / f"{name}.json"
+        return p.read_text(encoding="utf-8") if p.exists() else None
 
-def _load_artifact(session_dir: Path, name: str) -> Optional[str]:
-    """세션 디렉터리에서 이전에 저장된 아티팩트를 읽어옴. 없으면 None 반환."""
-    path = session_dir / f"{name}.json"
-    return path.read_text(encoding="utf-8") if path.exists() else None
-
-
-def _find_resumable_session(material_path: str) -> Optional[Path]:
-    """./outputs 하위에서 같은 학습 자료(material_path)에 대해
-    아직 완료되지 않은(completed=False) 가장 최근 세션 디렉터리를 탐색.
-    API 재호출 비용을 줄이기 위해 이전 중간 결과를 재활용하는 데 사용."""
-    outputs = Path(_OUTPUT_DIR)
-    if not outputs.exists():
-        return None
-    # 디렉터리 이름이 타임스탬프이므로 역순 정렬 = 최신 우선
-    sessions = sorted(
-        (s for s in outputs.iterdir() if s.is_dir()),
-        reverse=True,
-    )
-    for s in sessions:
-        meta_path = s / "session.json"
-        if not meta_path.exists():
-            continue
+    def mark_complete(self) -> None:
+        """session.json에 completed=True를 기록"""
+        meta_path = self.path / "session.json"
         try:
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            meta["completed"] = True
+            meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception:
-            continue
-        if meta.get("material") == material_path and not meta.get("completed"):
-            return s
-    return None
+            pass
 
-
-def _init_session(material_path: str) -> None:
-    """새 세션 디렉터리(./outputs/YYYYMMDD_HHMMSS)를 생성하고
-    메타데이터(session.json)를 기록한다."""
-    global _SESSION_DIR
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    _SESSION_DIR = Path(_OUTPUT_DIR) / ts
-    _SESSION_DIR.mkdir(parents=True, exist_ok=True)
-    meta = {
-        "material": material_path,    # 원본 학습 자료 경로
-        "completed": False,           # 세션 완료 여부
-        "started_at": ts,
-    }
-    (_SESSION_DIR / "session.json").write_text(
-        json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
-    print(f"  세션 시작 → {_SESSION_DIR}")
-    print()
-
-
-def _resume_session(session_dir: Path) -> None:
-    """기존 미완료 세션 디렉터리를 현재 세션으로 설정 (재개)"""
-    global _SESSION_DIR
-    _SESSION_DIR = session_dir
-    print(f"  세션 재개 → {_SESSION_DIR}")
-    print()
-
-
-def _mark_session_complete() -> None:
-    """모든 단계가 끝났을 때 session.json에 completed=True를 기록.
-    이후 _find_resumable_session에서 이 세션을 재개 대상에서 제외한다."""
-    if _SESSION_DIR is None:
-        return
-    meta_path = _SESSION_DIR / "session.json"
-    try:
-        meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        meta["completed"] = True
-        meta_path.write_text(
+    @classmethod
+    def new(cls, material_path: str, output_dir: str) -> "Session":
+        """타임스탬프 디렉터리를 생성하고 새 세션을 반환"""
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        session_dir = Path(output_dir) / ts
+        session_dir.mkdir(parents=True, exist_ok=True)
+        meta = {"material": material_path, "completed": False, "started_at": ts}
+        (session_dir / "session.json").write_text(
             json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
         )
-    except Exception:
-        pass
+        print(f"  세션 시작 → {session_dir}\n")
+        return cls(session_dir)
+
+    @classmethod
+    def find_resumable(cls, material_path: str, output_dir: str) -> Optional["Session"]:
+        """같은 자료에 대해 미완료된 가장 최근 세션을 탐색"""
+        outputs = Path(output_dir)
+        if not outputs.exists():
+            return None
+        for s in sorted(outputs.iterdir(), reverse=True):
+            meta_path = s / "session.json"
+            if not meta_path.exists():
+                continue
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if meta.get("material") == material_path and not meta.get("completed"):
+                print(f"  세션 재개 → {s}\n")
+                return cls(s)
+        return None
+
+    @classmethod
+    def resolve(cls, material_path: str, output_dir: str) -> tuple["Session", str]:
+        """세션 탐색 → 재개 여부 확인 → 아티팩트 로드를 한 번에 처리.
+        반환: (session, resume_context)"""
+        prior = cls.find_resumable(material_path, output_dir)
+
+        if prior:
+            saved_files = ', '.join(p.name for p in prior.path.glob('*.json') if p.name != 'session.json')
+            print(f"미완료 세션이 있습니다: {prior.path}")
+            print(f"저장된 파일: {saved_files}\n")
+
+            ans = input("  이어서 진행할까요? [Y/n]: ").strip().lower()
+            if ans in ("", "y", "yes"):
+                resume_context = ""
+                saved_analysis = prior.load("analysis")
+                saved_quiz     = prior.load("quiz")
+                if saved_analysis:
+                    resume_context += f"\n<saved_analysis>\n{saved_analysis}\n</saved_analysis>\n"
+                if saved_quiz:
+                    resume_context += f"\n<saved_quiz>\n{saved_quiz}\n</saved_quiz>\n"
+                return prior, resume_context
+
+        return cls.new(material_path, output_dir), ""
+
+
+_session: Optional[Session] = None  # 현재 활성 세션
 
 
 # ── 서브에이전트 헬퍼 ─────────────────────────────────────────────────────────
@@ -258,7 +256,8 @@ async def analyze_document(material: str) -> str:
 
     print("[문서 분석] 완료")
 
-    _save_artifact("analysis", result) # 저장
+    if _session:
+        _session.save("analysis", result)
 
     # 분석 결과 요약 출력
     try:
@@ -297,7 +296,8 @@ async def generate_quiz(
 
     print("[퀴즈 생성] 완료")
 
-    _save_artifact("quiz", result)
+    if _session:
+        _session.save("quiz", result)
 
     try:
         d = json.loads(result)
@@ -332,14 +332,16 @@ async def validate_quiz(quiz: str, analysis: str) -> str:
 
         if passed:
             print(f"[품질 검증] 완료  평균 점수: {avg:.0f}  PASS")
-            _save_artifact("validation", result)
+            if _session:
+                _session.save("validation", result)
         else:
             # FAIL인 경우 아티팩트를 저장하지 않음 — 재생성 후 새 퀴즈로 대체 예정
             print(f"[품질 검증] FAIL  평균 점수: {avg:.0f} → 재생성")
         print()
     except Exception:
-        print("[품질 검증] 완료")
-        _save_artifact("validation", result)
+        print("[품질 검증] 검증을 실패하였습니다.")
+        if _session:
+            _session.save("validation", result)
 
     return result
 
@@ -388,7 +390,8 @@ def collect_user_answers(quiz_json: str) -> str:
 
     print("=" * 40)
     result = json.dumps(answers, ensure_ascii=False)
-    _save_artifact("user_answers", result)
+    if _session:
+        _session.save("user_answers", result)
     return result
 
 
@@ -427,7 +430,8 @@ async def evaluate_feedback(
     result = await _run_subagent(evaluator_subagent, prompt)
 
     print("[피드백 생성] 완료")
-    _save_artifact("feedback", result)
+    if _session:
+        _session.save("feedback", result)
     return result
 
 
@@ -493,7 +497,8 @@ def display_result(feedback_json: str) -> str:
         print(next_study)
 
     print()
-    _mark_session_complete()  # 세션 완료 표시 — 이후 재개 대상에서 제외됨
+    if _session:
+        _session.mark_complete()  # 세션 완료 표시 — 이후 재개 대상에서 제외됨
     return "출력 완료"
 
 
@@ -561,35 +566,9 @@ async def main():
     print("\nStudy Agent  AI 기반 학습 퀴즈 생성기")
     print(f"자료: {material_path}\n")
 
-    # ── 이전 미완료 세션 탐색 및 재개 여부 확인 ──
-    # 중단된 세션이 있으면 API 호출 비용을 아끼기 위해 중간 결과 재활용.
-    resume_dir = _find_resumable_session(material_path)
-    resume_context = ""
-
-    if resume_dir:
-        saved_files = ', '.join(p.name for p in resume_dir.glob('*.json') if p.name != 'session.json')
-        print(f"미완료 세션이 있습니다: {resume_dir}")
-        print(f"저장된 파일: {saved_files}")
-        print()
-
-        ans = input("  이어서 진행할까요? [Y/n]: ").strip().lower()
-        if ans in ("", "y", "yes"):
-            _resume_session(resume_dir)
-
-            # 이전에 저장된 분석 결과와 퀴즈를 로드
-            saved_analysis = _load_artifact(resume_dir, "analysis")
-            saved_quiz     = _load_artifact(resume_dir, "quiz")
-
-            # 오케스트레이터에게 전달할 재개 컨텍스트
-            if saved_analysis:
-                resume_context += f"\n<saved_analysis>\n{saved_analysis}\n</saved_analysis>\n"
-            if saved_quiz:
-                resume_context += f"\n<saved_quiz>\n{saved_quiz}\n</saved_quiz>\n"
-        else:
-            # 사용자가 재개를 거부하면 새 세션 시작
-            _init_session(material_path)
-    else:
-        _init_session(material_path)
+    # ── 세션 탐색 · 재개 여부 확인 · 아티팩트 로드 ──
+    global _session
+    _session, resume_context = Session.resolve(material_path, _OUTPUT_DIR)
 
     # ── 오케스트레이터에게 전달할 최종 메시지 구성 ──
     difficulty_str = "자료에서 자동 판단" if _args.difficulty == "auto" else _args.difficulty
