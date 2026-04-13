@@ -104,6 +104,8 @@ python main.py test_files/biology.txt
 ## 실행 결과
 <iframe width="560" height="315" src="https://www.youtube.com/embed/jGcoyYbuI9U?si=BGHUL5qNDev4B9M7" title="YouTube video player" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" referrerpolicy="strict-origin-when-cross-origin" allowfullscreen></iframe>
 
+[![Video Label](http://img.youtube.com/vi/jGcoyYbuI9U/0.jpg)](https://youtu.be/jGcoyYbuI9U)
+
 ## 모델 구성
 
 | 역할 | Claude | OpenAI |
